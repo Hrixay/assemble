@@ -1,0 +1,20 @@
+{
+  "version": "{{VERSION}}",
+  "mode": "{{MODE}}",
+  "folder": "team",
+  "notebook": "../{{REPO}}-team",
+  "project": "{{PROJECT}}",
+  "human": "{{HUMAN}}",
+  "defaultBranch": "{{DEFAULT_BRANCH}}",
+  "separator": "{{SEPARATOR}}",
+  "remote": "{{REMOTE}}",
+  "precious": [
+    "team/CHATS.md",
+    "team/roles/**",
+    "team/assemble.json",
+    "CLAUDE.md",
+    ".claude/**",
+    ".github/**"{{PRECIOUS_EXTRA}}
+  ],
+  "adopted": {{ADOPTED_JSON}}
+}

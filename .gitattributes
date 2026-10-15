@@ -1,0 +1,2 @@
+# Check out every text file with LF line endings on every system (the scripts fail with CRLF).
+* text=auto eol=lf

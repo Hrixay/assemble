@@ -1,0 +1,652 @@
+#!/usr/bin/env bash
+# assemble-fixture-shim: a fake `gh` for the /assemble test fixtures. fixture.sh copies it to
+# <fixture>/bin/gh. It reads <fixture>/fixture.conf, logs every call to <fixture>/calls.log, and
+# never touches the network or a real GitHub account.
+#
+# Modes (FIXTURE_GH_MODE):
+#   missing     every call answers "command not found", exit 127
+#   logged-out  gh --version works; gh auth status says not logged in; other reads need a login
+#   offline     gh --version works; everything else fails to connect
+#   ok          logged in to github.com as FIXTURE_GH_LOGIN. It knows FIXTURE_GH_REPO (if set) and
+#               every repo the fake `gh repo create` made (a bare repo under <fixture>/remotes/).
+#
+# Reads, in every fixture: --version, auth status, repo view, pr list, pr view (with --comments it
+# prints the comments the way real gh does off a terminal), pr diff and GET-only api calls.
+# `gh api repos/<owner>/assemble/releases/latest` answers FIXTURE_LATEST_RELEASE from fixture.conf
+# when a fixture sets it (the update check), and a 404 otherwise.
+# `gh auth login` prints a fake one-time code and logs in nobody.
+#
+# Repo facts: a repo is ADMIN, PRIVATE, default branch main, not protected, no rulesets, no
+# GitHub Pages, unless <fixture>/gh-state/<owner>/<name>/repo.conf says otherwise (shell
+# assignments, written by tests/lib/fixture.sh fixture_existing):
+#   PERMISSION=ADMIN|MAINTAIN|WRITE|READ   VISIBILITY=PRIVATE|PUBLIC|INTERNAL   DEFAULT=<branch>
+#   PROTECTED=true|false|forbidden         RULES='<json array>'|forbidden    PAGES='<json>'
+#   ISSUES_MAX=<n> (the highest issue number; PRs count too, from their gh-state folders)
+# "forbidden" answers HTTP 403, as GitHub does for a reader without admin rights.
+#
+# Writes (FIXTURE_WRITES=yes, and only once the write gate <fixture>/write-screen-approved exists;
+# otherwise refused like every other write):
+#   gh repo create [<owner>/]<name> --private --source <dir> --remote origin [--push]
+#       makes the bare repo <fixture>/remotes/<owner>/<name>.git, adds the remote
+#       https://github.com/<owner>/<name>.git to <dir>, and with --push pushes its branch
+#   gh pr create [--repo R] [--base B] [--head H] --title T (--body X | --body-file F)
+#   gh pr comment <n> [--repo R] (--body X | --body-file F)
+#   gh pr close <n> [--repo R]
+#   gh auth setup-git     (sets the gh credential helper in the fixture's own global git config)
+#   gh api -X DELETE repos/<o>/<n>/git/refs/heads/<branch>
+# Pull requests live in <fixture>/gh-state/<owner>/<name>/pr-<n>/. headRefOid is read live from
+# the bare repo, so a push after a verdict shows up.
+#
+# Always refused, writes open or not (each breaks a rule of the skill): `gh pr merge` (only the
+# human merges; tests/lib/fake-gh-merge stands in for the Merge click), `gh pr review` (verdicts
+# are comments), `gh pr close --delete-branch`, `gh repo create` without --private or for another
+# account, and anything else not listed above. A refusal is logged as "REFUSED gh ..." and exits 1.
+# --jq is honoured only for the simple cases below; otherwise the full JSON is printed.
+# Portable bash: macOS bash 3.2 and Linux. No GNU-only flags.
+
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+conf="$here/../fixture.conf"
+[ -r "$conf" ] || { echo "fake gh: $conf is missing" >&2; exit 2; }
+. "$conf"
+FIXTURE_WRITES=${FIXTURE_WRITES:-no}
+
+printf 'gh %s\n' "$*" >> "$FIXTURE_ROOT/calls.log"
+
+refuse() {
+  printf 'REFUSED gh %s\n' "$*" >> "$FIXTURE_ROOT/calls.log"
+  printf 'fake gh (fixture %s): refused "gh %s". This test double answers read-only commands only, and writes only after the write screen.\n' "$FIXTURE_NAME" "$*" >&2
+  exit 1
+}
+rule_refuse() {
+  why=$1
+  shift
+  printf 'REFUSED gh %s   (rule: %s)\n' "$*" "$why" >> "$FIXTURE_ROOT/calls.log"
+  printf 'fake gh (fixture %s): refused "gh %s": %s.\n' "$FIXTURE_NAME" "$*" "$why" >&2
+  exit 1
+}
+need_login() {
+  printf 'To get started with GitHub CLI, please run:  gh auth login\n' >&2
+  printf 'Alternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.\n' >&2
+  exit 4
+}
+no_network() {
+  printf 'error connecting to api.github.com\n' >&2
+  printf 'check your internet connection or https://githubstatus.com\n' >&2
+  exit 1
+}
+no_repo() {
+  printf "GraphQL: Could not resolve to a Repository with the name '%s'. (repository)\n" "$1" >&2
+  exit 1
+}
+no_remote() {
+  printf 'none of the git remotes configured for this repository point to a known GitHub host. To tell gh about a new GitHub host, please use `gh auth login`\n' >&2
+  exit 1
+}
+not_found() {
+  printf '{"message":"Not Found","documentation_url":"https://docs.github.com/rest","status":"404"}\n'
+  printf 'gh: Not Found (HTTP 404)\n' >&2
+  exit 1
+}
+
+# repo_facts OWNER/NAME: load the repo's facts (defaults, then its repo.conf).
+repo_facts() {
+  PERMISSION=ADMIN; VISIBILITY=PRIVATE; DEFAULT=main; PROTECTED=false; RULES='[]'; PAGES=''; ISSUES_MAX=0
+  if [ -r "$FIXTURE_ROOT/gh-state/$1/repo.conf" ]; then . "$FIXTURE_ROOT/gh-state/$1/repo.conf"; fi
+}
+forbidden() {
+  printf '{"message":"Must have admin rights to Repository.","documentation_url":"https://docs.github.com/rest","status":"403"}\n'
+  printf 'gh: Must have admin rights to Repository. (HTTP 403)\n' >&2
+  exit 1
+}
+
+# The real git, with the tester's settings shut out, never looking above the fixture folder.
+rg() {
+  env HOME="$FIXTURE_ROOT/git-home" XDG_CONFIG_HOME="$FIXTURE_ROOT/git-home/.config" \
+    GIT_CONFIG_GLOBAL="$FIXTURE_ROOT/git-home/.gitconfig" GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+    GIT_CEILING_DIRECTORIES="$FIXTURE_ROOT" "$FIXTURE_REAL_GIT" "$@"
+}
+rgnet() { rg -c "url.$FIXTURE_ROOT/remotes/.insteadOf=https://github.com/" "$@"; }
+writes_open() { [ "$FIXTURE_WRITES" = yes ] && [ -e "$FIXTURE_ROOT/write-screen-approved" ]; }
+bare_of() { printf '%s/remotes/%s.git' "$FIXTURE_ROOT" "$1"; }
+state_of() { printf '%s/gh-state/%s' "$FIXTURE_ROOT" "$1"; }
+created() { [ -d "$(bare_of "$1")" ]; }
+known_repo() { { [ -n "$FIXTURE_GH_REPO" ] && [ "$1" = "$FIXTURE_GH_REPO" ]; } || created "$1"; }
+# cwd_repo: owner/name of the current folder's github.com origin, or nothing.
+# (The SSH forms are built from pieces so the leak scan doesn't read them as email addresses.)
+cwd_repo() {
+  u=$(rg remote get-url origin 2>/dev/null || true)
+  at='@'
+  scp="git${at}github.com:"
+  sshu="ssh://git${at}github.com/"
+  case "$u" in
+    https://github.com/*) r=${u#https://github.com/} ;;
+    "$scp"*) r=${u#"$scp"} ;;
+    "$sshu"*) r=${u#"$sshu"} ;;
+    *) return 0 ;;
+  esac
+  r=${r%.git}
+  r=${r%/}
+  printf '%s' "$r"
+}
+# repo_for FLAG_REPO: the repo a pr command acts on (exits when there is none).
+repo_for() {
+  if [ -n "$1" ]; then
+    known_repo "$1" || no_repo "$1"
+    printf '%s' "$1"
+    return 0
+  fi
+  r=$(cwd_repo)
+  if [ -n "$r" ] && known_repo "$r"; then printf '%s' "$r"; return 0; fi
+  [ -n "$FIXTURE_GH_REPO" ] || no_remote
+  printf '%s' "$FIXTURE_GH_REPO"
+}
+# JSON string from stdin (escapes \ " tab CR and joins lines with \n).
+json_stdin() {
+  awk 'BEGIN { ORS = ""; printf "\"" }
+       NR > 1 { printf "\\n" }
+       { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); gsub(/\r/, "\\r"); printf "%s", $0 }
+       END { printf "\"" }'
+}
+json_text() { printf '%s' "$1" | json_stdin; }
+pr_dir() { printf '%s/pr-%s' "$(state_of "$1")" "$2"; }
+pr_get() { cat "$(pr_dir "$1" "$2")/$3" 2>/dev/null || true; }
+pr_numbers() { # pr_numbers REPO: every PR number, ascending
+  d=$(state_of "$1")
+  [ -d "$d" ] || return 0
+  for p in "$d"/pr-*; do [ -d "$p" ] && printf '%s\n' "${p##*/pr-}"; done | sort -n
+}
+head_oid() { # head_oid REPO N: the PR head's commit, live from the bare repo
+  h=$(pr_get "$1" "$2" head)
+  rg --git-dir="$(bare_of "$1")" rev-parse --verify -q "refs/heads/$h" 2>/dev/null || pr_get "$1" "$2" head_oid
+}
+# pr_json_field REPO N FIELD: one field of a PR as JSON.
+pr_json_field() {
+  case "$3" in
+    number) printf '%s' "$2" ;;
+    url) json_text "https://github.com/$1/pull/$2" ;;
+    state) json_text "$(pr_get "$1" "$2" state)" ;;
+    title) json_text "$(pr_get "$1" "$2" title)" ;;
+    body) pr_get "$1" "$2" body | json_stdin ;;
+    headRefName) json_text "$(pr_get "$1" "$2" head)" ;;
+    baseRefName) json_text "$(pr_get "$1" "$2" base)" ;;
+    headRefOid) json_text "$(head_oid "$1" "$2")" ;;
+    author) printf '{"login":%s}' "$(json_text "$(pr_get "$1" "$2" author)")" ;;
+    isDraft) printf 'false' ;;
+    mergeable)
+      if [ "$(pr_get "$1" "$2" state)" = OPEN ]; then json_text MERGEABLE; else json_text UNKNOWN; fi ;;
+    mergeCommit)
+      m=$(pr_get "$1" "$2" merge_commit)
+      if [ -n "$m" ]; then printf '{"oid":%s}' "$(json_text "$m")"; else printf 'null'; fi ;;
+    comments)
+      printf '['
+      sep=''
+      cdir="$(pr_dir "$1" "$2")/comments"
+      if [ -d "$cdir" ]; then
+        for c in $(ls "$cdir" | sort -n); do
+          printf '%s{"author":{"login":%s},"body":%s}' "$sep" "$(json_text "$FIXTURE_GH_LOGIN")" "$(json_stdin < "$cdir/$c")"
+          sep=','
+        done
+      fi
+      printf ']' ;;
+    *) printf 'null' ;;
+  esac
+}
+pr_json() { # pr_json REPO N FIELDS(comma-separated)
+  printf '{'
+  sep=''
+  for f in $(printf '%s' "$3" | tr ',' ' '); do
+    printf '%s"%s":%s' "$sep" "$f" "$(pr_json_field "$1" "$2" "$f")"
+    sep=','
+  done
+  printf '}'
+}
+# pr_jq REPO N JQ: the simple --jq forms for one PR; returns 1 when JQ isn't one of them.
+pr_jq() {
+  case "$3" in
+    .mergeCommit.oid) pr_get "$1" "$2" merge_commit; echo ;;
+    .comments[].body)
+      cdir="$(pr_dir "$1" "$2")/comments"
+      [ -d "$cdir" ] || return 0
+      for c in $(ls "$cdir" | sort -n); do cat "$cdir/$c"; echo; done ;;
+    .number|.url|.state|.title|.headRefName|.baseRefName|.headRefOid|.mergeable)
+      v=$(pr_json_field "$1" "$2" "${3#.}")
+      v=${v#\"}; v=${v%\"}
+      printf '%s\n' "$v" ;;
+    *) return 1 ;;
+  esac
+}
+# find_pr REPO TARGET: a PR number from a number, a PR URL or a head branch name (open first).
+find_pr() {
+  case "$2" in
+    ''|*[!0-9]*) ;;
+    *) [ -d "$(pr_dir "$1" "$2")" ] && { printf '%s' "$2"; return 0; } ;;
+  esac
+  case "$2" in
+    https://github.com/*/pull/*) n=${2##*/pull/}; n=${n%%[!0-9]*}; [ -d "$(pr_dir "$1" "$n")" ] && { printf '%s' "$n"; return 0; } ;;
+  esac
+  b=$2
+  [ -n "$b" ] || b=$(rg branch --show-current 2>/dev/null || true)
+  hit=''
+  for n in $(pr_numbers "$1"); do
+    if [ "$(pr_get "$1" "$n" head)" = "$b" ]; then
+      if [ "$(pr_get "$1" "$n" state)" = OPEN ]; then printf '%s' "$n"; return 0; fi
+      hit=$n
+    fi
+  done
+  [ -z "$hit" ] || { printf '%s' "$hit"; return 0; }
+  printf 'no pull requests found for branch "%s"\n' "$b" >&2
+  exit 1
+}
+# body_from: the --body / --body-file value parsed into BODY (a file path or text).
+read_body() { # read_body BODY_TEXT BODY_FILE: prints the body
+  if [ -n "$2" ]; then
+    if [ "$2" = - ]; then cat; else cat -- "$2" || { echo "fake gh: can't read $2" >&2; exit 1; }; fi
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+if [ "$FIXTURE_GH_MODE" = missing ]; then
+  printf 'gh: command not found\n' >&2
+  exit 127
+fi
+
+all="$*"
+sub1=${1:-}
+sub2=${2:-}
+
+case "$sub1" in
+  --version|version)
+    printf 'gh version 2.80.0 (fixture)\nhttps://github.com/cli/cli/releases/tag/v2.80.0\n'
+    exit 0 ;;
+  auth)
+    case "$sub2" in
+      status) ;;
+      login)
+        printf '! First copy your one-time code: FAKE-0000\n' >&2
+        printf 'Open this URL to continue in your web browser: https://github.com/login/device\n' >&2
+        printf 'fake gh (fixture %s): this is a test double, so nobody was logged in.\n' "$FIXTURE_NAME" >&2
+        exit 1 ;;
+      setup-git)
+        [ "$FIXTURE_GH_MODE" = ok ] || need_login
+        writes_open || refuse "$all"
+        rg config --global --replace-all credential.https://github.com.helper '!gh auth git-credential'
+        exit 0 ;;
+      *) refuse "$all" ;;
+    esac ;;
+  repo)
+    case "$sub2" in
+      view) ;;
+      create) [ "$FIXTURE_GH_MODE" = ok ] || refuse "$all" ;;
+      *) refuse "$all" ;;
+    esac ;;
+  pr)
+    case "$sub2" in
+      list) ;;
+      merge) rule_refuse "no chat ever runs gh pr merge; the human clicks Merge on GitHub" "$all" ;;
+      review) rule_refuse "verdicts are posted with gh pr comment, never gh pr review" "$all" ;;
+      view|diff|create|comment|close) [ "$FIXTURE_GH_MODE" = ok ] || refuse "$all" ;;
+      *) refuse "$all" ;;
+    esac ;;
+  api) ;;
+  *) refuse "$all" ;;
+esac
+
+# ---------------------------------------------------------------------------------------------
+# Writes and the newer reads (mode ok only; checked above).
+if [ "$sub1" = repo ] && [ "$sub2" = create ]; then
+  writes_open || refuse "$all"
+  shift 2
+  name=''; private=no; src=''; rem=origin; push=no
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --private) private=yes; shift ;;
+      --public|--internal) rule_refuse "setup always creates private repos" "$all" ;;
+      --source|-s) src=${2:-}; shift 2 || shift ;;
+      --source=*) src=${1#--source=}; shift ;;
+      --remote|-r) rem=${2:-}; shift 2 || shift ;;
+      --remote=*) rem=${1#--remote=}; shift ;;
+      --push) push=yes; shift ;;
+      -d|--description|-h|--homepage|-t|--team|-p|--template|-g|--gitignore|-l|--license) shift 2 || shift ;;
+      -*) shift ;;
+      *) [ -n "$name" ] || name=$1; shift ;;
+    esac
+  done
+  [ "$private" = yes ] || rule_refuse "setup always creates private repos (--private)" "$all"
+  if [ -n "$src" ]; then src=$(CDPATH= cd -- "$src" && pwd) || { echo "fake gh: no folder $src" >&2; exit 1; }; fi
+  [ -n "$name" ] || { [ -n "$src" ] && name=$(basename -- "$src"); } || { echo "fake gh: a repo name is needed" >&2; exit 1; }
+  case "$name" in */*) owner=${name%%/*}; name=${name#*/} ;; *) owner=$FIXTURE_GH_LOGIN ;; esac
+  [ "$owner" = "$FIXTURE_GH_LOGIN" ] || rule_refuse "repos are created under the logged-in account ($FIXTURE_GH_LOGIN), never another owner" "$all"
+  repo="$owner/$name"
+  if known_repo "$repo"; then
+    printf 'GraphQL: Name already exists on this account (createRepository)\n' >&2
+    exit 1
+  fi
+  mkdir -p "$FIXTURE_ROOT/remotes/$owner"
+  rg init -q --bare -b main "$(bare_of "$repo")"
+  printf '✓ Created repository %s on GitHub\n  https://github.com/%s\n' "$repo" "$repo"
+  if [ -n "$src" ]; then
+    rg -C "$src" remote add "$rem" "https://github.com/$repo.git"
+    printf '✓ Added remote https://github.com/%s.git\n' "$repo"
+    if [ "$push" = yes ]; then
+      rgnet -C "$src" push -q -u "$rem" HEAD
+      printf '✓ Pushed commits to https://github.com/%s.git\n' "$repo"
+    fi
+  fi
+  exit 0
+fi
+
+if [ "$sub1" = pr ] && { [ "$sub2" = create ] || [ "$sub2" = comment ] || [ "$sub2" = close ] || [ "$sub2" = view ] || [ "$sub2" = diff ]; }; then
+  shift 2
+  frepo=''; base=''; headb=''; title=''; btext=''; bfile=''; target=''; JQ=''; JSONF=''; nameonly=no; withcomments=no
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -R|--repo) frepo=${2:-}; shift 2 || shift ;;
+      --repo=*) frepo=${1#--repo=}; shift ;;
+      -B|--base) base=${2:-}; shift 2 || shift ;;
+      --base=*) base=${1#--base=}; shift ;;
+      -H|--head) headb=${2:-}; shift 2 || shift ;;
+      --head=*) headb=${1#--head=}; shift ;;
+      -t|--title) title=${2:-}; shift 2 || shift ;;
+      --title=*) title=${1#--title=}; shift ;;
+      -b|--body) btext=${2:-}; shift 2 || shift ;;
+      --body=*) btext=${1#--body=}; shift ;;
+      -F|--body-file) bfile=${2:-}; shift 2 || shift ;;
+      --body-file=*) bfile=${1#--body-file=}; shift ;;
+      -q|--jq) JQ=${2:-}; shift 2 || shift ;;
+      --jq=*) JQ=${1#--jq=}; shift ;;
+      --json) JSONF=${2:-}; shift 2 || shift ;;
+      --json=*) JSONF=${1#--json=}; shift ;;
+      --name-only) nameonly=yes; shift ;;
+      --delete-branch|-d) [ "$sub2" != close ] || rule_refuse "never --delete-branch: it deletes the local branch and can switch the user's checkout" "$all"; shift ;;
+      -c|--comments) withcomments=yes; shift ;;
+      --color) shift 2 || shift ;;
+      -*) shift ;;
+      *) [ -n "$target" ] || target=$1; shift ;;
+    esac
+  done
+  repo=$(repo_for "$frepo")
+  case "$sub2" in
+    create)
+      writes_open || refuse "$all"
+      created "$repo" || refuse "$all"
+      bare=$(bare_of "$repo")
+      [ -n "$headb" ] || headb=$(rg branch --show-current 2>/dev/null || true)
+      [ -n "$base" ] || base=main
+      [ -n "$title" ] || { echo "fake gh: pr create needs --title (this double has no editor)" >&2; exit 1; }
+      if ! rg --git-dir="$bare" rev-parse --verify -q "refs/heads/$headb" >/dev/null; then
+        printf 'pull request create failed: GraphQL: Head sha can'"'"'t be blank, Base sha can'"'"'t be blank, No commits between %s and %s, Head ref must be a branch (createPullRequest)\n' "$base" "$headb" >&2
+        exit 1
+      fi
+      rg --git-dir="$bare" rev-parse --verify -q "refs/heads/$base" >/dev/null ||
+        { printf 'pull request create failed: GraphQL: Base ref must be a branch (createPullRequest)\n' >&2; exit 1; }
+      if [ "$(rg --git-dir="$bare" rev-list --count "refs/heads/$base..refs/heads/$headb")" -eq 0 ]; then
+        printf 'pull request create failed: GraphQL: No commits between %s and %s (createPullRequest)\n' "$base" "$headb" >&2
+        exit 1
+      fi
+      for n in $(pr_numbers "$repo"); do
+        if [ "$(pr_get "$repo" "$n" head)" = "$headb" ] && [ "$(pr_get "$repo" "$n" state)" = OPEN ]; then
+          printf 'a pull request for branch "%s" into branch "%s" already exists:\nhttps://github.com/%s/pull/%s\n' "$headb" "$base" "$repo" "$n" >&2
+          exit 1
+        fi
+      done
+      last=$(pr_numbers "$repo" | tail -n 1)
+      n=$(( ${last:-0} + 1 ))
+      d=$(pr_dir "$repo" "$n")
+      mkdir -p "$d/comments"
+      printf '%s' "$headb" > "$d/head"
+      printf '%s' "$base" > "$d/base"
+      printf 'OPEN' > "$d/state"
+      printf '%s' "$title" > "$d/title"
+      printf '%s' "$FIXTURE_GH_LOGIN" > "$d/author"
+      read_body "$btext" "$bfile" > "$d/body"
+      rg --git-dir="$bare" rev-parse "refs/heads/$headb" > "$d/head_oid"
+      printf 'https://github.com/%s/pull/%s\n' "$repo" "$n"
+      exit 0 ;;
+    comment)
+      writes_open || refuse "$all"
+      n=$(find_pr "$repo" "$target")
+      d="$(pr_dir "$repo" "$n")/comments"
+      mkdir -p "$d"
+      last=$(ls "$d" | sort -n | tail -n 1)
+      k=$(( ${last:-0} + 1 ))
+      read_body "$btext" "$bfile" > "$d/$k"
+      printf 'https://github.com/%s/pull/%s#issuecomment-%s\n' "$repo" "$n" "$((1000 + k))"
+      exit 0 ;;
+    close)
+      writes_open || refuse "$all"
+      n=$(find_pr "$repo" "$target")
+      [ "$(pr_get "$repo" "$n" state)" = OPEN ] || { echo "fake gh: pull request #$n is not open" >&2; exit 1; }
+      printf 'CLOSED' > "$(pr_dir "$repo" "$n")/state"
+      printf '✓ Closed pull request %s#%s\n' "$repo" "$n"
+      exit 0 ;;
+    view)
+      n=$(find_pr "$repo" "$target")
+      if [ -n "$JQ" ] && pr_jq "$repo" "$n" "$JQ"; then exit 0; fi
+      if [ -n "$JSONF" ]; then pr_json "$repo" "$n" "$JSONF"; echo; exit 0; fi
+      if [ "$withcomments" = yes ]; then
+        # As real gh prints them when stdout is not a terminal: only the comments, each as
+        # author / association / edited / status, then the body between two "--" lines.
+        cdir="$(pr_dir "$repo" "$n")/comments"
+        [ -d "$cdir" ] || exit 0
+        for c in $(ls "$cdir" | sort -n); do
+          printf 'author:\t%s\nassociation:\towner\nedited:\tfalse\nstatus:\tnone\n--\n' "$FIXTURE_GH_LOGIN"
+          cat "$cdir/$c"; echo
+          printf -- '--\n'
+        done
+        exit 0
+      fi
+      printf '%s #%s\n%s\n' "$(pr_get "$repo" "$n" title)" "$n" "$(pr_get "$repo" "$n" state)"
+      pr_get "$repo" "$n" body
+      exit 0 ;;
+    diff)
+      n=$(find_pr "$repo" "$target")
+      bare=$(bare_of "$repo")
+      created "$repo" || { echo "fake gh: no diff for a repo this fixture didn't create" >&2; exit 1; }
+      ho=$(head_oid "$repo" "$n")
+      b=$(pr_get "$repo" "$n" base)
+      if [ "$nameonly" = yes ]; then
+        rg --git-dir="$bare" diff --name-only "refs/heads/$b...$ho"
+      else
+        rg --git-dir="$bare" diff "refs/heads/$b...$ho"
+      fi
+      exit 0 ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------------------------------
+# The read-only commands (and api writes, which only the DELETE of a branch ref passes).
+# Read the flags this double cares about. FLAG_REPO is --repo/-R; POS is the first positional
+# argument after the subcommand words; JQ is --jq/-q; METHOD is GET unless -X/--method or a
+# field flag says otherwise.
+shift
+[ "$sub1" = api ] || shift
+FLAG_REPO=''; POS=''; JQ=''; JSON=no; JSONF=''; METHOD=GET; STATE=open; HEADF=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -R|--repo) FLAG_REPO=${2:-}; shift 2 || shift ;;
+    --repo=*) FLAG_REPO=${1#--repo=}; shift ;;
+    -q|--jq) JQ=${2:-}; shift 2 || shift ;;
+    --jq=*) JQ=${1#--jq=}; shift ;;
+    --json) JSON=yes; JSONF=${2:-}; shift 2 || shift ;;
+    --json=*) JSON=yes; JSONF=${1#--json=}; shift ;;
+    -X|--method) METHOD=$(printf '%s' "${2:-}" | tr '[:lower:]' '[:upper:]'); shift 2 || shift ;;
+    --method=*) METHOD=$(printf '%s' "${1#--method=}" | tr '[:lower:]' '[:upper:]'); shift ;;
+    -f|-F|--field|--raw-field|--input) [ "$METHOD" != GET ] || METHOD=POST; shift 2 || shift ;;
+    -s|--state) STATE=$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]'); shift 2 || shift ;;
+    --state=*) STATE=$(printf '%s' "${1#--state=}" | tr '[:upper:]' '[:lower:]'); shift ;;
+    -H|--head) [ "$sub1" = pr ] && HEADF=${2:-}; shift 2 || shift ;;
+    --header|-t|--template|-b|--branch|-L|--limit|-A|--author|-B|--base|-S|--search|--cache|--hostname|-p|--preview)
+      shift 2 || shift ;;
+    -*) shift ;;
+    *) [ -n "$POS" ] || POS=$1; shift ;;
+  esac
+done
+
+case "$FIXTURE_GH_MODE" in
+  logged-out)
+    if [ "$sub1" = auth ]; then
+      printf 'You are not logged into any GitHub hosts. To log in, run: gh auth login\n' >&2
+      exit 1
+    fi
+    [ "$METHOD" = GET ] || refuse "$all"
+    need_login ;;
+  offline)
+    if [ "$sub1" = auth ]; then
+      printf 'github.com\n'
+      printf '  X Timeout trying to log in to github.com account %s (keyring)\n' "$FIXTURE_GH_LOGIN"
+      printf '  - Active account: true\n'
+      printf '  - error connecting to api.github.com: dial tcp: lookup api.github.com: no such host\n'
+      exit 1
+    fi
+    [ "$METHOD" = GET ] || refuse "$all"
+    no_network ;;
+esac
+
+# Mode ok from here on.
+case "$sub1" in
+  auth)
+    printf 'github.com\n'
+    printf '  ✓ Logged in to github.com account %s (keyring)\n' "$FIXTURE_GH_LOGIN"
+    printf '  - Active account: true\n'
+    printf '  - Git operations protocol: https\n'
+    printf '  - Token: gho_****\n'
+    printf "  - Token scopes: 'gist', 'read:org', 'repo', 'workflow'\n"
+    exit 0 ;;
+  repo)
+    target=${POS:-$FLAG_REPO}
+    if [ -z "$target" ]; then
+      target=$(cwd_repo)
+      [ -n "$target" ] && known_repo "$target" || target=$FIXTURE_GH_REPO
+      [ -n "$target" ] || no_remote
+    fi
+    known_repo "$target" || no_repo "$target"
+    rowner=${target%%/*}
+    rname=${target#*/}
+    empty=false
+    if created "$target" && [ -z "$(rg --git-dir="$(bare_of "$target")" for-each-ref --count=1 refs/heads/)" ]; then empty=true; fi
+    repo_facts "$target"
+    priv=false
+    [ "$VISIBILITY" != PRIVATE ] || priv=true
+    if [ "$JSON" = yes ]; then
+      printf '{"name":"%s","nameWithOwner":"%s","owner":{"login":"%s"},"defaultBranchRef":{"name":"%s"},"isEmpty":%s,"isFork":false,"isPrivate":%s,"parent":null,"viewerPermission":"%s","visibility":"%s"}\n' \
+        "$rname" "$target" "$rowner" "$DEFAULT" "$empty" "$priv" "$PERMISSION" "$VISIBILITY"
+    else
+      printf 'name:\t%s\ndescription:\tA tiny fictional web app\n' "$target"
+    fi
+    exit 0 ;;
+  pr)
+    if [ -n "$FLAG_REPO" ]; then
+      known_repo "$FLAG_REPO" || no_repo "$FLAG_REPO"
+      repo=$FLAG_REPO
+    else
+      repo=$(repo_for '')
+    fi
+    nums=''
+    for n in $(pr_numbers "$repo"); do
+      s=$(pr_get "$repo" "$n" state)
+      case "$STATE" in
+        all) ;;
+        open) [ "$s" = OPEN ] || continue ;;
+        closed) [ "$s" = CLOSED ] || [ "$s" = MERGED ] || continue ;;
+        merged) [ "$s" = MERGED ] || continue ;;
+      esac
+      [ -z "$HEADF" ] || [ "$(pr_get "$repo" "$n" head)" = "$HEADF" ] || continue
+      nums="$n $nums"
+    done
+    if [ "$JSON" = yes ]; then
+      case "$JQ" in
+        '.[].number'|'.[].headRefName'|'.[].url'|'.[].state')
+          for n in $nums; do pr_jq "$repo" "$n" ".${JQ#.[].}"; done
+          exit 0 ;;
+      esac
+      printf '['
+      sep=''
+      for n in $nums; do printf '%s%s' "$sep" "$(pr_json "$repo" "$n" "$JSONF")"; sep=','; done
+      printf ']\n'
+    else
+      for n in $nums; do printf '%s\t%s\t%s\t%s\n' "$n" "$(pr_get "$repo" "$n" title)" "$(pr_get "$repo" "$n" head)" "$(pr_get "$repo" "$n" state)"; done
+    fi
+    exit 0 ;;
+  api)
+    ep=${POS#/}
+    query=''
+    case "$ep" in *\?*) query=${ep#*\?} ;; esac
+    ep=${ep%%\?*}
+    if [ -n "$FIXTURE_GH_REPO" ]; then
+      ep=$(printf '%s' "$ep" | sed -e "s|{owner}|${FIXTURE_GH_REPO%%/*}|g" -e "s|{repo}|${FIXTURE_GH_REPO#*/}|g")
+    fi
+    if [ "$METHOD" != GET ]; then
+      writes_open || refuse "$all"
+      case "$METHOD:$ep" in
+        DELETE:repos/*/*/git/refs/heads/*)
+          r=${ep#repos/}
+          o=${r%%/*}; r=${r#*/}; nm=${r%%/*}; br=${r#*/git/refs/heads/}
+          created "$o/$nm" || not_found
+          rg --git-dir="$(bare_of "$o/$nm")" update-ref -d "refs/heads/$br" 2>/dev/null || not_found
+          exit 0 ;;
+      esac
+      refuse "$all"
+    fi
+    # The skill's own repo: the update check reads its newest release. FIXTURE_LATEST_RELEASE (a tag,
+    # set in fixture.conf by a fixture that wants one) is the answer; without it the answer is a 404.
+    case "$ep" in
+      repos/*/assemble/releases/latest)
+        [ -n "${FIXTURE_LATEST_RELEASE:-}" ] || not_found
+        if [ "$JQ" = .tag_name ]; then printf '%s\n' "$FIXTURE_LATEST_RELEASE"; else printf '{"tag_name":"%s"}\n' "$FIXTURE_LATEST_RELEASE"; fi
+        exit 0 ;;
+    esac
+    case "$ep" in
+      user)
+        case "$JQ" in
+          .login) printf '%s\n' "$FIXTURE_GH_LOGIN" ;;
+          .id) printf '%s\n' "$FIXTURE_GH_ID" ;;
+          .name) printf '%s\n' "$FIXTURE_GH_NAME" ;;
+          '.id, .login, .name'|'.id,.login,.name')
+            printf '%s\n%s\n%s\n' "$FIXTURE_GH_ID" "$FIXTURE_GH_LOGIN" "$FIXTURE_GH_NAME" ;;
+          *) printf '{"login":"%s","id":%s,"name":"%s","type":"User"}\n' "$FIXTURE_GH_LOGIN" "$FIXTURE_GH_ID" "$FIXTURE_GH_NAME" ;;
+        esac
+        exit 0 ;;
+      repos/*/*/branches/*|repos/*/*/rules/branches/*|repos/*/*/contents/*|repos/*/*/pages|repos/*/*/issues)
+        r=${ep#repos/}
+        o=${r%%/*}; r=${r#*/}; nm=${r%%/*}
+        known_repo "$o/$nm" || not_found
+        repo_facts "$o/$nm"
+        case "$ep" in
+          */rules/branches/*)
+            [ "$RULES" != forbidden ] || forbidden
+            printf '%s\n' "$RULES" ;;
+          */branches/*)
+            b=${ep##*/branches/}
+            [ "$PROTECTED" != forbidden ] || forbidden
+            rg --git-dir="$(bare_of "$o/$nm")" rev-parse --verify -q "refs/heads/$b" > /dev/null 2>&1 || ! created "$o/$nm" || not_found
+            if [ "$JQ" = .protected ]; then printf '%s\n' "$PROTECTED"; else printf '{"name":"%s","protected":%s}\n' "$b" "$PROTECTED"; fi ;;
+          */pages)
+            [ -n "$PAGES" ] || not_found
+            case "$JQ" in
+              .source) printf '%s\n' "$PAGES" | sed -n 's/.*"source":\({[^}]*}\).*/\1/p' ;;
+              *) printf '%s\n' "$PAGES" ;;
+            esac ;;
+          */issues)
+            # Only the newest-first, one-item form the skill uses: ?state=all&per_page=1.
+            top=$ISSUES_MAX
+            for n in $(pr_numbers "$o/$nm"); do [ "$n" -le "$top" ] || top=$n; done
+            if [ "$top" -eq 0 ]; then
+              case "$JQ" in .\[0\].number*) printf 'null\n' ;; *) printf '[]\n' ;; esac
+            else
+              case "$JQ" in .\[0\].number*) printf '%s\n' "$top" ;; *) printf '[{"number":%s}]\n' "$top" ;; esac
+            fi ;;
+          */contents/*)
+            path=${ep#repos/$o/$nm/contents/}
+            ref=main
+            case "$query" in ref=*) ref=${query#ref=}; ref=${ref%%&*} ;; esac
+            created "$o/$nm" || not_found
+            rg --git-dir="$(bare_of "$o/$nm")" cat-file -e "refs/heads/$ref:$path" 2>/dev/null || not_found
+            if [ "$JQ" = .path ]; then printf '%s\n' "$path"; else printf '{"path":"%s","type":"file"}\n' "$path"; fi ;;
+        esac
+        exit 0 ;;
+    esac
+    not_found ;;
+esac
+refuse "$all"

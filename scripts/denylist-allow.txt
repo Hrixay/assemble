@@ -1,0 +1,23 @@
+# Exceptions for scripts/denylist-scan.sh. One per line:   <path>:<line-text>
+#
+#   <path>       a tracked file, exactly as `git ls-files` prints it
+#   <line-text>  case-sensitive text, at least 12 characters, that appears on exactly one line
+#                of that file
+#
+# A denylist hit on that one line is skipped, for every term on it, and the scan prints how many
+# entries it used. The scan FAILS if an entry's text is shorter than 12 characters, appears on no
+# line of its file (stale) or on more than one line (too broad). So keep allowed lines short and
+# about one thing.
+#
+# The scanner reads the copy of this file that sits next to it, never the copy in the folder it
+# scans, so a branch can't add its own exceptions for the maintainer's run.
+#
+# This file is published and scanned like every other file: never write a denylisted term here.
+# Pick nearby text on the same line instead.
+#
+# Every entry needs a reviewed PR. The only planned entry is the avoid line in
+# skills/assemble/reference/names.md, below. It lands before the line holds any denylisted
+# name: the pre-push hook runs main's copy of this file, so the maintainer adds the reserved
+# names to that line only after this entry is on main and scripts/install-hooks.sh was re-run.
+
+skills/assemble/reference/names.md:The author's six original names, reserved

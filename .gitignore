@@ -1,0 +1,28 @@
+# OS junk
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+
+# Editor leftovers
+*.swp
+*.swo
+*~
+
+# Secrets: never commit env files (an example file is fine)
+.env
+.env.*
+!.env.example
+
+# Scratch
+scratch/
+tmp/
+*.tmp
+*.bak
+
+# Local Claude Code state
+.claude/worktrees/
+.claude/settings.local.json

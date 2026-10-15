@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# assemble-fixture-shim: a git wrapper for the /assemble test fixtures. fixture.sh copies it to
+# <fixture>/bin/git. It reads <fixture>/fixture.conf, logs every call to <fixture>/calls.log, and
+# runs the real git with the tester's own global and system settings shut out.
+#
+#   read-only commands (status, log, show, config --get, branch --list, worktree list,
+#       stash list, hash-object without -w, ...) run on the real git, unchanged
+#   fetch, ls-remote (and, once writes are open, push, pull and clone)
+#       never reach the network. FIXTURE_GIT_MODE:
+#         fake-remote   fetch does nothing; ls-remote answers from the local refs/remotes/origin/*
+#                       refs. push, pull and clone are refused.
+#         offline       fetch and ls-remote fail with "Could not resolve host", exit 128.
+#         local-remote  the GitHub repos are real bare repos under <fixture>/remotes/<owner>/<name>.git
+#                       (the fake `gh repo create` makes them). These commands run the real git
+#                       with https://github.com/ rewritten to that folder for that one call, so
+#                       `git remote get-url origin` still shows the github.com address.
+#   everything else (commit, add, init, switch, worktree add, config <key> <value>, push, ...)
+#       is a write. FIXTURE_WRITES:
+#         no    (the default) every write is refused, logged as "REFUSED git ...", exit 1:
+#               nothing may be written before the write screen.
+#         yes   writes are refused the same way until the write gate exists: the file
+#               <fixture>/write-screen-approved. The tester creates it while the write screen is
+#               on screen, before answering (tests/new-path-test.sh does the same). After that,
+#               writes run on the real git, except the ones that break the skill's git rules,
+#               which are always refused: `git add -A`, `--all`, `.` or `-u`; a commit without
+#               explicit paths (`--`, `--pathspec-from-file`, or `--allow-empty`), or with `-a`
+#               or `--amend`; a bare `git push`, or a push with `--force`, `--no-verify`,
+#               `--delete`, `--mirror`, `--all` or a `+`/`:` refspec; a new branch without
+#               `--no-track` (`switch -c`, `worktree add -b`, `branch <new>`) and `checkout -b`;
+#               `git config --global` or `--system` writes; `stash`, `reset --hard`, `clean`.
+#   a read this double can't fake (remote show, which would reach the network) is logged as
+#       "UNSUPPORTED git ..." and exits 1; that is a gap in the double, not a write.
+# Portable bash: macOS bash 3.2 and Linux. No GNU-only flags.
+
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+conf="$here/../fixture.conf"
+[ -r "$conf" ] || { echo "fake git: $conf is missing" >&2; exit 2; }
+. "$conf"
+FIXTURE_WRITES=${FIXTURE_WRITES:-no}
+
+export HOME="$FIXTURE_ROOT/git-home"
+export XDG_CONFIG_HOME="$FIXTURE_ROOT/git-home/.config"
+export GIT_CONFIG_GLOBAL="$FIXTURE_ROOT/git-home/.gitconfig"
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_TERMINAL_PROMPT=0
+export GIT_CEILING_DIRECTORIES="$FIXTURE_ROOT"
+
+printf 'git %s\n' "$*" >> "$FIXTURE_ROOT/calls.log"
+
+[ "$#" -gt 0 ] || exec "$FIXTURE_REAL_GIT"
+
+refuse() {
+  printf 'REFUSED git %s\n' "$*" >> "$FIXTURE_ROOT/calls.log"
+  printf 'fake git (fixture %s): refused "git %s". Nothing may be written before the write screen.\n' "$FIXTURE_NAME" "$*" >&2
+  exit 1
+}
+# rule_refuse WHY ARGS...: a write after the write gate that breaks one of the skill's git rules.
+rule_refuse() {
+  why=$1
+  shift
+  printf 'REFUSED git %s   (rule: %s)\n' "$*" "$why" >> "$FIXTURE_ROOT/calls.log"
+  printf 'fake git (fixture %s): refused "git %s": %s.\n' "$FIXTURE_NAME" "$*" "$why" >&2
+  exit 1
+}
+unsupported() {
+  printf 'UNSUPPORTED git %s\n' "$*" >> "$FIXTURE_ROOT/calls.log"
+  printf 'fake git (fixture %s): "git %s" would reach the network; this test double cannot answer it.\n' "$FIXTURE_NAME" "$*" >&2
+  exit 1
+}
+run() { exec "$FIXTURE_REAL_GIT" "$@"; }
+
+# Split the global options (kept in G, passed on to every real git call) from the subcommand.
+all="$*"
+G=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -C|-c|--git-dir|--work-tree|--namespace) G+=("$1" "${2:-}"); shift 2 || shift ;;
+    --git-dir=*|--work-tree=*|--namespace=*|--no-pager|-P|--no-optional-locks|--literal-pathspecs|--no-replace-objects|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--paginate|-p)
+      G+=("$1"); shift ;;
+    *) break ;;
+  esac
+done
+[ "$#" -gt 0 ] || run ${G[@]+"${G[@]}"}
+sub=$1
+shift
+
+rgit() { "$FIXTURE_REAL_GIT" ${G[@]+"${G[@]}"} "$@"; }
+
+# The write gate: open only for a fixture built with writes, once write-screen-approved exists.
+writes_open() { [ "$FIXTURE_WRITES" = yes ] && [ -e "$FIXTURE_ROOT/write-screen-approved" ]; }
+# A network command against the local bare remotes (local-remote mode).
+net_run() {
+  exec "$FIXTURE_REAL_GIT" -c "url.$FIXTURE_ROOT/remotes/.insteadOf=https://github.com/" ${G[@]+"${G[@]}"} "$sub" "$@"
+}
+
+no_host() {
+  url=$(rgit remote get-url origin 2>/dev/null || printf 'origin')
+  host=$(printf '%s' "$url" | sed -e 's|^[a-z+]*://||' -e 's|^[^@/]*@||' -e 's|[:/].*$||')
+  printf "fatal: unable to access '%s/': Could not resolve host: %s\n" "$url" "$host" >&2
+  exit 128
+}
+
+has_arg() { # has_arg WORD ARGS...: is WORD one of ARGS?
+  w=$1; shift
+  for a in "$@"; do [ "$a" = "$w" ] && return 0; done
+  return 1
+}
+has_prefix() { # has_prefix PREFIX ARGS...: does one of ARGS start with PREFIX?
+  w=$1; shift
+  for a in "$@"; do case "$a" in "$w"*) return 0 ;; esac; done
+  return 1
+}
+
+# guard_write: the skill's git rules, checked on every write once the gate is open.
+guard_write() {
+  case "$sub" in
+    add)
+      for a in "$@"; do
+        [ "$a" != -- ] || break
+        case "$a" in -A|--all|.|./|-u|--update|--no-ignore-removal) rule_refuse "add explicit paths, never -A, --all, . or -u" "$all" ;; esac
+      done ;;
+    commit)
+      for a in "$@"; do
+        [ "$a" != -- ] || break
+        case "$a" in -a|--all|--amend) rule_refuse "commit explicit paths; never -a or --amend" "$all" ;; esac
+      done
+      if ! has_arg -- "$@" && ! has_prefix --pathspec-from-file "$@" && ! has_arg --allow-empty "$@"; then
+        rule_refuse "commit with explicit paths (git commit -m ... -- <paths>)" "$all"
+      fi ;;
+    push)
+      npos=0
+      for a in "$@"; do
+        case "$a" in
+          -f|--force|--force-with-lease|--force-with-lease=*|--force-if-includes|--no-verify|--delete|-d|--mirror|--all|--prune)
+            rule_refuse "no force, no-verify, delete, mirror or all pushes" "$all" ;;
+          -*) ;;
+          *) npos=$((npos + 1))
+             case "$a" in +*|:*) rule_refuse "no + or : refspecs" "$all" ;; esac ;;
+        esac
+      done
+      [ "$npos" -ge 2 ] || rule_refuse "never a bare git push: name the remote and the branch (git push -u origin HEAD)" "$all" ;;
+    switch)
+      if has_arg -c "$@" || has_arg -C "$@" || has_arg --create "$@" || has_arg --force-create "$@"; then
+        has_arg --no-track "$@" || rule_refuse "a new branch needs --no-track" "$all"
+      fi ;;
+    checkout)
+      if has_arg -b "$@" || has_arg -B "$@"; then rule_refuse "make branches with git switch --no-track -c" "$all"; fi ;;
+    worktree)
+      if [ "${1:-}" = add ] && { has_arg -b "$@" || has_arg -B "$@"; }; then
+        has_arg --no-track "$@" || rule_refuse "a new branch needs --no-track" "$all"
+      fi ;;
+    config)
+      for a in "$@"; do case "$a" in --global|--system) rule_refuse "git settings are repo-local, never --global or --system" "$all" ;; esac; done ;;
+    stash|clean) rule_refuse "setup never stashes or cleans anyone's files" "$all" ;;
+    reset)
+      if has_arg --hard "$@"; then rule_refuse "no reset --hard" "$all"; fi ;;
+  esac
+  return 0
+}
+
+case "$sub" in
+  --version|version|--help|help|-h|--exec-path|--exec-path=*|--html-path|--man-path|--info-path)
+    run ${G[@]+"${G[@]}"} "$sub" "$@" ;;
+  status|log|show|ls-files|shortlog|rev-parse|check-ignore|cat-file|for-each-ref|show-ref|diff|describe|ls-tree|merge-base|rev-list|var|grep|blame|name-rev|count-objects|cherry|check-ref-format|check-attr|diff-tree|diff-files|diff-index|whatchanged)
+    case "$sub" in
+      log|show|diff|diff-tree|diff-files|diff-index|whatchanged)
+        # --output=<file> makes these commands write a file
+        for a in "$@"; do case "$a" in --output|--output=*) refuse "$all" ;; esac; done ;;
+    esac
+    run ${G[@]+"${G[@]}"} "$sub" "$@" ;;
+  config)
+    for a in "$@"; do
+      case "$a" in
+        --get|--get-all|--get-regexp|--get-urlmatch|--list|-l|--show-origin|--show-scope|get|list)
+          run ${G[@]+"${G[@]}"} config "$@" ;;
+      esac
+    done
+    writes_open || refuse "$all"
+    guard_write "$@"
+    run ${G[@]+"${G[@]}"} config "$@" ;;
+  branch)
+    for a in "$@"; do
+      case "$a" in -d|-D|--delete|-m|-M|--move|-c|-C|--copy|-u|--set-upstream-to|--set-upstream-to=*|--unset-upstream|--edit-description|-f|--force|-t|--track|--track=*|--no-track)
+        writes_open || refuse "$all"
+        case "$a" in -t|--track|--track=*|-u|--set-upstream-to|--set-upstream-to=*) rule_refuse "branches never track origin/<default>" "$all" ;; esac
+        run ${G[@]+"${G[@]}"} branch "$@" ;;
+      esac
+    done
+    if has_arg --list "$@" || has_arg -l "$@" || has_arg --show-current "$@"; then run ${G[@]+"${G[@]}"} branch "$@"; fi
+    for a in "$@"; do
+      case "$a" in
+        -*) ;;
+        *) writes_open || refuse "$all"
+           rule_refuse "a new branch needs --no-track" "$all" ;;
+      esac
+    done
+    run ${G[@]+"${G[@]}"} branch "$@" ;;
+  remote)
+    case "${1:-}" in
+      ''|-v|--verbose|get-url) run ${G[@]+"${G[@]}"} remote "$@" ;;
+      show) unsupported "$all" ;;
+      *) writes_open || refuse "$all"
+         run ${G[@]+"${G[@]}"} remote "$@" ;;
+    esac ;;
+  stash)
+    # stash list and stash show only read; every other stash form writes.
+    case "${1:-}" in list|show) run ${G[@]+"${G[@]}"} stash "$@" ;; esac
+    writes_open || refuse "$all"
+    guard_write "$@"
+    run ${G[@]+"${G[@]}"} stash "$@" ;;
+  hash-object)
+    # Without -w it only prints a hash (the self-check's fingerprint of `git diff HEAD`).
+    has_arg -w "$@" || run ${G[@]+"${G[@]}"} hash-object "$@"
+    writes_open || refuse "$all"
+    run ${G[@]+"${G[@]}"} hash-object "$@" ;;
+  worktree)
+    [ "${1:-}" != list ] || run ${G[@]+"${G[@]}"} worktree "$@"
+    writes_open || refuse "$all"
+    guard_write "$@"
+    run ${G[@]+"${G[@]}"} worktree "$@" ;;
+  symbolic-ref)
+    n=0
+    # -d / --delete (also abbreviated, or bundled like -qd) removes a ref: a write
+    for a in "$@"; do
+      case "$a" in
+        --d*) refuse "$all" ;;
+        --*) ;;
+        -*d*) refuse "$all" ;;
+      esac
+    done
+    for a in "$@"; do case "$a" in -*) ;; *) n=$((n + 1)) ;; esac; done
+    [ "$n" -le 1 ] || refuse "$all"
+    run ${G[@]+"${G[@]}"} symbolic-ref "$@" ;;
+  fetch)
+    [ "$FIXTURE_GIT_MODE" = offline ] && no_host
+    [ "$FIXTURE_GIT_MODE" != local-remote ] || net_run "$@"
+    exit 0 ;;
+  ls-remote)
+    [ "$FIXTURE_GIT_MODE" = offline ] && no_host
+    [ "$FIXTURE_GIT_MODE" != local-remote ] || net_run "$@"
+    exitcode=no; remote=''; npat=0; pats=''
+    for a in "$@"; do
+      case "$a" in
+        --exit-code) exitcode=yes ;;
+        -*) ;;
+        *) if [ -z "$remote" ]; then remote=$a; else pats="$pats
+$a"; npat=$((npat + 1)); fi ;;
+      esac
+    done
+    found=no
+    refs=$(rgit for-each-ref --format='%(objectname) %(refname)' refs/remotes/origin/)
+    while read -r sha ref; do
+      [ -n "${ref:-}" ] || continue
+      b=${ref#refs/remotes/origin/}
+      [ "$b" != HEAD ] || continue
+      show=no
+      if [ "$npat" -eq 0 ]; then
+        show=yes
+      else
+        while read -r p; do
+          [ -n "$p" ] || continue
+          # Unquoted on purpose: the pattern is a glob, matched against the end of the ref.
+          # shellcheck disable=SC2254
+          case "refs/heads/$b" in $p|*/$p) show=yes ;; esac
+        done <<EOF
+$pats
+EOF
+      fi
+      if [ "$show" = yes ]; then printf '%s\trefs/heads/%s\n' "$sha" "$b"; found=yes; fi
+    done <<EOF
+$refs
+EOF
+    if [ "$exitcode" = yes ] && [ "$found" = no ]; then exit 2; fi
+    exit 0 ;;
+  push|pull|clone)
+    writes_open || refuse "$all"
+    [ "$FIXTURE_GIT_MODE" = offline ] && no_host
+    [ "$FIXTURE_GIT_MODE" = local-remote ] || refuse "$all"
+    guard_write "$@"
+    net_run "$@" ;;
+  *)
+    writes_open || refuse "$all"
+    guard_write "$@"
+    run ${G[@]+"${G[@]}"} "$sub" "$@" ;;
+esac

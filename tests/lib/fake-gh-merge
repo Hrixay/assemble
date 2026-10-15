@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# fake-gh-merge: the test stand-in for the human clicking Merge on GitHub, for a fixture built with
+# writes (tests/lib/fixture.sh, fixture_shims --writes). It merges a pull request that the fake gh
+# opened: it merges the head branch into the base branch of the fixture's bare repo (a squash merge
+# by default, as GitHub's "Squash and merge" does), then marks the PR MERGED.
+#
+# It is deliberately NOT copied into the fixture's bin/ folder, so a Claude session under test can't
+# run it: only the tester (or a test script) can, by its path. The fake `gh pr merge` stays refused.
+#
+# Usage: tests/lib/fake-gh-merge FIXTURE_FOLDER PR_NUMBER [--repo OWNER/NAME] [--squash | --merge]
+#        The repo defaults to the only repo under FIXTURE_FOLDER/gh-state that has that PR number
+#        open (the project repo in a new-project fixture).
+# Exit:  0 = merged; 1 = not merged (with the reason); 2 = bad usage.
+# Portable bash: macOS bash 3.2 and Linux. No GNU-only flags.
+
+set -eu
+LC_ALL=C
+export LC_ALL
+
+usage() { echo "usage: tests/lib/fake-gh-merge FIXTURE_FOLDER PR_NUMBER [--repo OWNER/NAME] [--squash | --merge]" >&2; exit 2; }
+[ "$#" -ge 2 ] || usage
+[ -d "$1" ] && [ -f "$1/fixture.conf" ] || { echo "fake-gh-merge: $1 is not a fixture folder" >&2; exit 2; }
+root=$(CDPATH= cd -- "$1" && pwd -P)
+n=$2
+case "$n" in ''|*[!0-9]*) usage ;; esac
+shift 2
+repo=''
+how=squash
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --repo) repo=${2:-}; shift 2 || usage ;;
+    --squash) how=squash; shift ;;
+    --merge) how=merge; shift ;;
+    *) usage ;;
+  esac
+done
+
+. "$root/fixture.conf"
+rg() {
+  env HOME="$root/git-home" XDG_CONFIG_HOME="$root/git-home/.config" \
+    GIT_CONFIG_GLOBAL="$root/git-home/.gitconfig" GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+    GIT_CEILING_DIRECTORIES="$root" "$FIXTURE_REAL_GIT" \
+    -c user.name="$FIXTURE_GH_NAME" -c user.email="$FIXTURE_GH_ID+$FIXTURE_GH_LOGIN@users.noreply.github.com" "$@"
+}
+
+if [ -z "$repo" ]; then
+  for d in "$root"/gh-state/*/*/pr-"$n"; do
+    [ -d "$d" ] || continue
+    [ "$(cat "$d/state")" = OPEN ] || continue
+    r=${d%/pr-"$n"}
+    r=${r#"$root"/gh-state/}
+    [ -z "$repo" ] || { echo "fake-gh-merge: PR #$n is open in more than one repo; pass --repo" >&2; exit 2; }
+    repo=$r
+  done
+  [ -n "$repo" ] || { echo "fake-gh-merge: no open PR #$n in $root/gh-state" >&2; exit 1; }
+fi
+pr="$root/gh-state/$repo/pr-$n"
+bare="$root/remotes/$repo.git"
+[ -d "$pr" ] && [ -d "$bare" ] || { echo "fake-gh-merge: no PR #$n in $repo" >&2; exit 1; }
+[ "$(cat "$pr/state")" = OPEN ] || { echo "fake-gh-merge: PR #$n is $(cat "$pr/state"), not OPEN" >&2; exit 1; }
+head=$(cat "$pr/head")
+base=$(cat "$pr/base")
+title=$(cat "$pr/title")
+headsha=$(rg --git-dir="$bare" rev-parse --verify -q "refs/heads/$head") || { echo "fake-gh-merge: the head branch $head is gone" >&2; exit 1; }
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/fake-gh-merge.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+rg clone -q --no-local "$bare" "$tmp/w"
+rg -C "$tmp/w" checkout -q "$base"
+if [ "$how" = squash ]; then
+  if ! rg -C "$tmp/w" merge -q --squash "origin/$head" > "$tmp/out" 2>&1; then
+    cat "$tmp/out" >&2
+    echo "fake-gh-merge: PR #$n can't be merged cleanly (as GitHub would say: this branch has conflicts)" >&2
+    exit 1
+  fi
+  rg -C "$tmp/w" commit -q -m "$title (#$n)"
+else
+  if ! rg -C "$tmp/w" merge -q --no-ff -m "Merge pull request #$n from $head" "origin/$head" > "$tmp/out" 2>&1; then
+    cat "$tmp/out" >&2
+    echo "fake-gh-merge: PR #$n can't be merged cleanly (as GitHub would say: this branch has conflicts)" >&2
+    exit 1
+  fi
+fi
+rg -C "$tmp/w" push -q origin "HEAD:refs/heads/$base"
+sha=$(rg -C "$tmp/w" rev-parse HEAD)
+printf '%s' "$sha" > "$pr/merge_commit"
+printf '%s' "$headsha" > "$pr/head_oid"
+printf 'MERGED' > "$pr/state"
+printf 'merge %s #%s (%s) into %s: %s\n' "$repo" "$n" "$how" "$base" "$sha" >> "$root/calls.log"
+printf '✓ Merged pull request %s#%s (%s) into %s at %s\n' "$repo" "$n" "$how" "$base" "$sha"

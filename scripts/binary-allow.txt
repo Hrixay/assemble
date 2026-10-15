@@ -1,0 +1,11 @@
+# Binary files that scripts/leak-scan.sh and scripts/denylist-scan.sh may accept. One path per
+# line, exactly as `git ls-files` prints it.
+#
+# Both scanners FAIL on any file with a NUL byte (binary, UTF-16, most images and PDFs) unless its
+# path is listed here. A listed file still has its printable text scanned (image and PDF
+# metadata often holds names and home-folder paths), so strip that metadata first.
+#
+# The scanners read the copy of this file that sits next to them, never the copy in the folder
+# they scan. Every entry needs a reviewed PR.
+#
+# No entries yet: every file in the repository is text.

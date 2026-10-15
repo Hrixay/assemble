@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# assemble-fixture-shim: a fake `ssh` for the /assemble test fixtures. fixture.sh copies it to
+# <fixture>/bin/ssh. It logs every call to <fixture>/calls.log and never opens a connection, so a
+# fixture can't reach the network or use the tester's real SSH keys.
+#
+# It always answers as a computer with no GitHub SSH key: "Permission denied (publickey).",
+# exit 255. A fixture whose origin is not on github.com uses that to prove the skill never runs
+# the SSH test there: tests/check-untouched.sh doesn't count an ssh call as a write, but the
+# fixture's expected.md says calls.log must hold no `ssh` line.
+# Portable bash: macOS bash 3.2 and Linux. No GNU-only flags.
+
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+conf="$here/../fixture.conf"
+[ -r "$conf" ] || { echo "fake ssh: $conf is missing" >&2; exit 2; }
+. "$conf"
+
+printf 'ssh %s\n' "$*" >> "$FIXTURE_ROOT/calls.log"
+
+printf 'Permission denied (publickey).\n' >&2
+exit 255

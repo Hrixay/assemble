@@ -1,0 +1,22 @@
+{
+  "version": "1.0.0",
+  "mode": "beside-repo",
+  "folder": "team",
+  "notebook": "../lemonade-team",
+  "project": "Lemonade",
+  "human": "Priya",
+  "defaultBranch": "master",
+  "separator": "·",
+  "remote": "maple-st/lemonade",
+  "precious": [
+    "team/CHATS.md",
+    "team/roles/**",
+    "team/assemble.json",
+    "CLAUDE.md",
+    ".claude/**",
+    ".github/**",
+    "CNAME",
+    "team/RUNBOOK.md"
+  ],
+  "adopted": {}
+}

@@ -1,0 +1,6 @@
+# assemble:begin · managed by /assemble
+.claude/worktrees/
+.env
+.env.*
+!.env.example
+# assemble:end

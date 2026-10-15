@@ -1,0 +1,35 @@
+MIT License
+
+Copyright (c) 2026 Hriday Jain
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+
+Files the skill generates
+
+Files that /assemble writes into your project (for example `team/`, the
+CLAUDE.md block and the PR template) are yours. To the extent the author and
+contributors have any rights in them, they are dedicated to the public domain
+under CC0 1.0. No attribution or licence notice is needed in your project.
+
+This section covers only the files rendered into your project. The skill
+itself, including the templates inside this repository, stays under the MIT
+licence above. CC0 1.0 legal code:
+https://creativecommons.org/publicdomain/zero/1.0/legalcode

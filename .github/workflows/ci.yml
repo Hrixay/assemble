@@ -1,0 +1,106 @@
+name: checks
+
+# Runs on pushes and on pull requests. Never use pull_request_target here: it would run fork code
+# with this repo's secrets. GitHub doesn't pass secrets to pull requests from forks, so the
+# denylist job fails closed on those, and the maintainer runs main's copy of the local denylist
+# on the PR before merging. A pull request runs its own copy of this file and of scripts/, so a
+# green run on a PR that changes either proves nothing: read those changes by hand (CONTRIBUTING.md).
+#
+# The runner image is pinned to ubuntu-24.04 because ubuntu-latest moves to Ubuntu 26 on 19 Oct 2026.
+# Move to a newer image on purpose, in its own PR.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # actions/checkout v7.0.1, pinned to its full commit SHA (the v7 tag pointed here on 2026-10-12)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Validate the skill (frontmatter, real YAML parse, name, description, line count, VERSION)
+        env:
+          ASSEMBLE_REQUIRE_YAML: "1"
+        run: bash scripts/validate.sh
+
+  templates:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # actions/checkout v7.0.1, pinned to its full commit SHA (the v7 tag pointed here on 2026-10-12)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Templates agree with PLACEHOLDERS.md
+        run: bash tests/templates-test.sh
+      - name: check-output.sh passes on the rendered example and fails on seeded bad copies
+        run: bash tests/check-output-test.sh
+
+  fixtures:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # actions/checkout v7.0.1, pinned to its full commit SHA (the v7 tag pointed here on 2026-10-12)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Every fixture builds and its fake gh, git and ssh answer as expected.md assumes
+        run: bash tests/build-fixtures.sh
+      - name: The New path's git and gh steps run end to end on the fakes (Small and Standard)
+        run: bash tests/new-path-test.sh
+      - name: The Existing path's git and gh steps run end to end on the fakes (in-repo, beside-repo, shared)
+        run: bash tests/existing-path-test.sh
+
+  leak-scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # actions/checkout v7.0.1, pinned to its full commit SHA (the v7 tag pointed here on 2026-10-12)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Generic leak scan (emails, home paths, keys, IP addresses)
+        run: bash scripts/leak-scan.sh
+
+  denylist:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # actions/checkout v7.0.1, pinned to its full commit SHA (the v7 tag pointed here on 2026-10-12)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Private denylist scan (fails closed when the secret is empty)
+        env:
+          ASSEMBLE_DENYLIST: ${{ secrets.ASSEMBLE_DENYLIST }}
+        run: bash scripts/denylist-scan.sh
+
+  selftest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # actions/checkout v7.0.1, pinned to its full commit SHA (the v7 tag pointed here on 2026-10-12)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Seeded self-tests (each check fails on seeded bad input; the pre-push hook blocks a leak)
+        env:
+          ASSEMBLE_REQUIRE_YAML: "1"
+        run: bash scripts/selftest.sh
+
+  reruns:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # actions/checkout v7.0.1, pinned to its full commit SHA (the v7 tag pointed here on 2026-10-12)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: The re-run commands (continue, cleanup, add, retire, check and repair) run end to end on the fakes
+        run: bash tests/rerun-test.sh

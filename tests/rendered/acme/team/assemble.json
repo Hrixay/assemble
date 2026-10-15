@@ -1,0 +1,21 @@
+{
+  "version": "1.0.0",
+  "mode": "in-repo",
+  "folder": "team",
+  "notebook": "../acme-team",
+  "project": "Acme",
+  "human": "Priya",
+  "defaultBranch": "main",
+  "separator": "·",
+  "remote": "priya-acme/acme",
+  "precious": [
+    "team/CHATS.md",
+    "team/roles/**",
+    "team/assemble.json",
+    "CLAUDE.md",
+    ".claude/**",
+    ".github/**",
+    "db/migrations/**"
+  ],
+  "adopted": {}
+}
