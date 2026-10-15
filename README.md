@@ -1,4 +1,4 @@
-# assemble: run any project with a small team of named Claude chats
+# Assemble: run any project with a small team of named Claude chats
 
 **The employee method, by Hriday Jain**
 
