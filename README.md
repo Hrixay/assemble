@@ -1,115 +1,181 @@
-# Assemble: run any project with a small team of named Claude chats
+<div align="center">
 
-**The employee method, by Hriday Jain**
+# Assemble
 
-Claude Code can now run several chats at once, and on the desktop app one chat can start others.
-`/assemble` is how those chats work together as a team.
+**Run any project with a small team of named Claude chats.<br>You talk to one of them: your Chief of Staff.**
 
-You talk to one chat only: your **Chief of Staff**. The Chief thinks ideas through with you,
-hands the work to a few named employee chats (a doer such as a Builder, a Reviewer when the
-project calls for one, and others only if needed), checks their work, and comes back to you with the research and the
-decisions only you can make. Every chat reads the same shared notes at the start of every
-session, so nobody needs the project explained twice and the same mistake isn't made twice.
+![version](https://img.shields.io/badge/version-1.0.0-1f6feb)
+![licence](https://img.shields.io/badge/licence-MIT-2ea043)
+![Claude Code](https://img.shields.io/badge/Claude%20Code-terminal%20%7C%20desktop-d97757)
 
+*The employee method, by Hriday Jain*
+
+</div>
+
+---
+
+One Claude chat doing everything forgets what was decided, mixes jobs and repeats its mistakes.
+Ten chats with no structure is worse. **assemble** sets up the structure: a Chief of Staff you
+talk to, a few employee chats that each have one job, and one shared notebook that every chat
+reads before it does anything. Your project ends up more detailed, more accurate and much
+easier to manage.
+
+Claude Code can now run a team of chats. **assemble is how they work together.**
+
+## How it works
+
+```mermaid
+flowchart TD
+    You(["You"]) <--> Chief["Chief of Staff<br/><i>your only contact</i>"]
+    Chief --> Builder["Builder"]
+    Chief --> Reviewer["Reviewer"]
+    Chief --> Researcher["Researcher"]
+    Builder <-.-> Reviewer
+    Builder <-.-> Researcher
+    Builder & Reviewer & Researcher & Chief --- Notebook[("team/ notebook<br/>the ask · log · decisions<br/>tasks · lessons · who's who")]
 ```
-            You
-             │
-      Chief of Staff  ── your only contact; ideates, coordinates, reports
-       │      │     │
-   Builder Reviewer Researcher …   (only the roles your project needs)
-       └──────┴─────┘
-   team/  ── the shared notebook every chat reads first:
-             the ask · log · decisions · tasks · lessons · who's who
+
+- **You only talk to the Chief.** The Chief thinks ideas through with you, gives you options
+  with a recommendation, and brings you the research and the decisions only you can make.
+- **The employees do the work.** Each has one job, a list of things it never does, and a
+  place it is allowed to write. They can talk to each other to sort things out; anything
+  that matters reaches the Chief.
+- **The notebook is the memory.** Every chat reads it at the start of every session, so
+  nobody needs the project explained twice and a mistake recorded once isn't made again.
+
+## Get started
+
+### 1. Install it: just ask Claude
+
+Open Claude Code (terminal or desktop app) and paste this:
+
+```text
+Install the assemble skill for Claude Code from https://github.com/Hrixay/assemble.
+Clone it with git (git clone --depth 1 https://github.com/Hrixay/assemble.git ~/.assemble-src),
+then copy its skills/assemble folder to ~/.claude/skills/assemble, replacing any older copy.
+If git isn't available, download the latest release's source zip instead. If a permission or
+sandbox prompt appears, show me what it is and wait for my OK. Tell me when I can type /assemble.
 ```
 
-## What you need
+<details>
+<summary>Prefer to install by hand?</summary>
 
-- Claude Code in the **terminal** or the **desktop app** (Code tab). The browser version
-  (claude.ai/code) isn't supported yet.
-- `git`, and the GitHub CLI `gh`, logged in (`gh auth login`).
-- A project on github.com, or an empty folder (the skill can create a private repo for it).
-
-## Install
-
-**Terminal:** paste these two lines.
+**Terminal:**
 
 ```bash
 git clone --depth 1 https://github.com/Hrixay/assemble.git ~/.assemble-src
 mkdir -p ~/.claude/skills && cp -R ~/.assemble-src/skills/assemble ~/.claude/skills/assemble
 ```
 
-**Desktop app only:** on this repo's Releases page, download the latest release's "Source code
-(zip)", unzip it, and copy its `skills/assemble` folder into `~/.claude/skills/` (on a Mac, Finder → Go → Go to
-Folder… → `~/.claude/skills`; on Windows, `%USERPROFILE%\.claude\skills`).
+**Desktop app:** on the [Releases page](https://github.com/Hrixay/assemble/releases), download
+the latest "Source code (zip)", unzip it, and copy its `skills/assemble` folder into
+`~/.claude/skills/` (Mac: Finder → Go → Go to Folder… → `~/.claude/skills`; Windows:
+`%USERPROFILE%\.claude\skills`).
 
-Type `/assemble` to check it's there; if it doesn't show up, restart Claude Code.
+If `/assemble` doesn't show up afterwards, restart Claude Code.
 
-## Your first ten minutes
+</details>
 
-1. Open Claude Code **in your project folder** (or an empty folder for a new idea).
-2. Type `/assemble`.
-3. It checks your machine first, then asks whether this is a new or an existing project.
-4. A few short questions, or a read-only look around your repo, and it proposes a team sized to
-   the project, with three name ideas per employee. You approve the team and pick the names.
-5. It shows every file it will write. **Nothing is written until you say yes**, and its own
-   setup arrives as a pull request.
-6. It tells you how to open your Chief. From then on, talk to the Chief. On the desktop app the
-   Chief can start the rest of the team himself; otherwise you get exact steps for each chat.
+### 2. Run it in your project
 
-Team sizes: **Small** (Chief + one doer, with a fresh helper checking each change), **Standard**
-(Chief + doer + a Reviewer chat) or **Full** (Standard plus a Researcher, Designer, Editor,
-Analyst or a role of your own). Up to six chats.
+Open Claude Code **in your project's folder**, or in an empty folder for a brand-new idea, and type:
 
-## What it writes
+```text
+/assemble
+```
 
-- A `team/` folder: `README.md` (where things stand), `the-ask.md` (your request, word for word,
-  never edited), `LOG.md`, `DECISIONS.md` (in your own words), `TASKS.md` (with "Waiting on
-  you"), `LESSONS.md`, `GLOSSARY.md`, `ROSTER.md`, `CHATS.md` (the rules every chat follows),
-  a review checklist and one job description per chat.
-- A short block at the end of your `CLAUDE.md` so every chat loads the rules.
-- A pull request template with a reviewer handoff section.
+### 3. Talk to your Chief
 
-For a live, public or shared repo, the notes go in a separate private repo next to the project,
-so a note can never trigger a deploy or be seen publicly. When the notes stay in your repo,
-existing files that do the same job (a `LOG.md`, a decisions file) are used where they are.
+When setup is done, it tells you how to open your Chief of Staff. From then on, that's the
+only chat you need. On the desktop app the Chief can start the rest of the team himself.
+
+## What happens when you type `/assemble`
+
+1. **It checks your setup** (git, GitHub login) before asking anything.
+2. **It asks: new project or existing?**
+3. **It gets to know the project.** For a new one, a few short questions about what you're
+   making. For an existing one, a read-only look around the repo.
+4. **It proposes a team** sized to the project, with three name ideas for each employee. You
+   approve the team and pick the names.
+5. **It shows you every file it will write.** Nothing is written until you say yes, and the
+   setup itself arrives as a pull request.
+6. **It hands you to your Chief.**
+
+## Your team
+
+| Team | Chats | Good for |
+|---|---|---|
+| **Small** | Chief + one doer (a fresh helper checks each change) | small projects, weekend ideas |
+| **Standard** | Chief + doer + a Reviewer chat | most projects |
+| **Full** | Standard + a Researcher, Designer, Editor, Analyst or a role of your own | big or research-heavy work |
+
+The doer is whatever your project needs: a Builder for code, an Editor for writing, an Analyst
+for data. Up to six chats. You can add or retire one later with `/assemble add` and
+`/assemble retire`.
+
+## The notebook
+
+Everything lives in one `team/` folder:
+
+| File | What it holds |
+|---|---|
+| `the-ask.md` | your original request, word for word, never edited |
+| `README.md` | where things stand right now |
+| `DECISIONS.md` | every decision, in your own words |
+| `TASKS.md` | what's left, who's on what, and what's waiting on you |
+| `LOG.md` | what happened, newest first |
+| `LESSONS.md` | mistakes not to repeat |
+| `ROSTER.md` · `CHATS.md` | who's who, and the rules every chat follows |
+| `roles/` | one job description per chat |
+
+It also adds a short block to your `CLAUDE.md` so every chat loads the rules, and a pull
+request template. If your repo is live, public or shared, the notebook goes in a separate
+private repo next to it instead, so a note can never trigger a deploy or be seen publicly.
 
 See [`docs/example-lemonade/`](docs/example-lemonade/) for a fictional project with every file
 filled in.
 
-## Why each rule exists
+## The rules that make it work
 
-- **One contact.** You talk to the Chief only, so you get one clear picture instead of five chats.
-- **Only you decide.** Chats propose; a decision exists only when you said yes, recorded in your
-  own words.
-- **The notes are the memory.** Chats forget; files don't. Every chat reads the notes first.
-- **Every change is a pull request, checked by someone who didn't write it.** You click Merge.
-- **The PR is the record; a chat message is only the doorbell.** Anything agreed is written down.
-- **Lessons are written down the same day** and every chat reads them, so mistakes aren't repeated.
+| Rule | Why |
+|---|---|
+| You talk to the Chief only | one clear picture instead of five chats |
+| Only you decide | chats propose; a decision exists only when you said yes |
+| The notebook is the memory | chats forget; files don't |
+| Every change is a pull request, checked by someone who didn't write it | you click Merge |
+| The PR is the record, a message is only the doorbell | anything agreed is written down |
+| Lessons are written down the same day | the same mistake isn't made twice |
 
-## Update and uninstall
+## What you need
 
-- `/assemble check` tells you when a newer version exists and prints the update steps.
-- To update by hand in the terminal: `git -C ~/.assemble-src pull --ff-only`, then
-  `rm -rf ~/.claude/skills/assemble`, then run the second install line again.
-- To uninstall, delete `~/.claude/skills/assemble`. Projects keep their `team/` folder.
+- **Claude Code**, in the terminal or the desktop app (the browser version isn't supported yet)
+- **git**, and the **GitHub CLI** (`gh`) logged in with `gh auth login`
+- A project on **github.com**, or an empty folder (it can create a private repo for you)
 
 ## Good to know
 
 - **Usage:** each open chat uses your Claude plan. Small teams are the default for small
-  projects, and you pick each chat's model on the approval screen.
-- **Version 1.0 gaps:** a separate notes repo for a brand-new project that is already live, and
-  re-runs on teams whose notes live in a separate repo, aren't written yet; the skill says so
-  and stops. No GitHub means no review loop yet, so GitHub is required for now.
-- **The desktop app** path was built from the same steps as the terminal and is less
-  battle-tested. Tell us what breaks.
+  projects, and you choose each chat's model on the approval screen.
+- **Version 1.0 can't yet** set up a brand-new project that is already live, or add and
+  retire employees on a team whose notebook lives in a separate repo. It says so and stops.
+- **The desktop app route** is newer and less tested than the terminal. Issues and pull
+  requests are welcome.
+- **Updating:** `/assemble check` tells you when there's a new version. By hand in the
+  terminal: `git -C ~/.assemble-src pull --ff-only`, then `rm -rf ~/.claude/skills/assemble`,
+  then the second install line again.
+- **Uninstalling:** delete `~/.claude/skills/assemble`. Your projects keep their `team/` folder.
 - Unrelated projects with similar names exist (for example a `team-assemble` plugin, as of
   2026-10-12).
 
-## Licence, in plain words
+## Licence
 
-- **The skill** is under the [MIT licence](LICENSE): you can use, change and share it, as long as
-  copies of the skill keep the copyright and licence notice.
-- **The files it writes into your project** (for example `team/`, the CLAUDE.md block and the PR
-  template) are yours. They are dedicated to the public domain under CC0 1.0, so your project
-  needs no attribution and no licence notice for them.
-- Contributions come in under the same terms they go out on: see [CONTRIBUTING.md](CONTRIBUTING.md).
+- **The skill** is [MIT](LICENSE): use it, change it, share it, keeping the copyright notice.
+- **The files it writes into your project** are yours (public domain under CC0 1.0): no
+  attribution needed.
+- Contributions come in under the same terms: see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+<div align="center">
+
+*Built on Claude Code. The employee method, by Hriday Jain.*
+
+</div>
